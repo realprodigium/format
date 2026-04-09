@@ -70,17 +70,48 @@ async def process_file(file: UploadFile = File(...)):
         # Volver a leer desde la fila encontrada
         df = pd.read_excel(io.BytesIO(contents), header=header_row_index)
 
+        # 1. Limpiar columnas completamente vacías (como Unnamed: 6, 7)
+        df = df.dropna(axis=1, how='all')
+
         # Normalizar nombres de columnas
         df.columns = [str(c).strip() for c in df.columns]
         
-        # Identificar columnas de Valor y Saldo (pueden venir como 'VALOR', 'Suma de VALOR', etc)
+        # 2. Identificar y filtrar filas de basura (repetidas cabeceras o metadatos)
+        # Identificar columnas de Valor y Saldo
         valor_cols = [c for c in df.columns if 'valor' in c.lower()]
         saldo_cols = [c for c in df.columns if 'saldo' in c.lower()]
+        fecha_cols = [c for c in df.columns if 'fecha' in c.lower()]
         
+        # Filtro de filas:
+        if fecha_cols:
+            fecha_col = fecha_cols[0]
+            # Eliminar filas donde la fecha sea igual al nombre de la columna (cabeceras repetidas)
+            df = df[df[fecha_col].astype(str).str.lower() != fecha_col.lower()]
+            
+            # Eliminar filas de metadatos comunes en extractos bancarios
+            garbage_keywords = ['información', 'cliente:', 'dirección', 'desde', 'hasta', 'movimientos:', 'resumen:']
+            mask = df[fecha_col].astype(str).lower().str.contains('|'.join(garbage_keywords), na=False)
+            df = df[~mask]
+            
+            # Eliminar filas donde casi todo sea NaN (posibles separadores)
+            df = df.dropna(subset=[fecha_col])
+
+        # Limpiar columnas de dinero
         cols_to_fix = valor_cols + saldo_cols
-        
         for col in cols_to_fix:
             df[col] = df[col].apply(clean_currency)
+
+        # 3. Eliminar filas que quedaron en 0 en Valor y Saldo después de la limpieza y que no tienen descripción real
+        # (Esto ayuda a eliminar filas de totales o subtotales que no queremos en la tabla de datos)
+        if valor_cols and saldo_cols:
+            desc_cols = [c for c in df.columns if 'descrip' in c.lower()]
+            if desc_cols:
+                desc_col = desc_cols[0]
+                # Si el valor y saldo son 0 y la descripción parece metadato, borrar
+                # (A veces hay transacciones de 0, pero suelen tener descripción clara)
+                metadata_desc = ['desde', 'hasta', 'nro cuenta', 'cliente', 'sucursal']
+                mask_meta = df[desc_col].astype(str).lower().str.contains('|'.join(metadata_desc), na=False)
+                df = df[~mask_meta]
 
         # Exportar a Excel con formato de tabla
         output = io.BytesIO()
@@ -91,45 +122,44 @@ async def process_file(file: UploadFile = File(...)):
             worksheet = writer.sheets['Data Procesada']
             
             num_rows, num_cols = df.shape
-            from openpyxl.utils import get_column_letter
-            last_col_letter = get_column_letter(num_cols)
-            # El rango incluye la cabecera (fila 1) hasta num_rows + 1
-            table_range = f"A1:{last_col_letter}{num_rows + 1}"
-            
-            from openpyxl.worksheet.table import Table, TableStyleInfo
-            tab = Table(displayName="TablaProcesada", ref=table_range)
-            
-            style = TableStyleInfo(name="TableStyleMedium9", showFirstColumn=False,
-                                   showLastColumn=False, showRowStripes=True, showColumnStripes=False)
-            tab.tableStyleInfo = style
-            worksheet.add_table(tab)
-            
-            # Aplicar formato numérico explícito a las columnas de dinero
-            # Esto soluciona el problema de que Excel haga "recuento" (count) en lugar de suma
-            from openpyxl.styles import NamedStyle
-            # Crear un estilo de número si no existe
-            number_format = '#,##0.00'
-            
-            for i, col_name in enumerate(df.columns):
-                col_letter = get_column_letter(i + 1)
+            if num_rows > 0:
+                from openpyxl.utils import get_column_letter
+                last_col_letter = get_column_letter(num_cols)
+                table_range = f"A1:{last_col_letter}{num_rows + 1}"
                 
-                # Si es columna de dinero, aplicar formato
-                is_money = any(kw in col_name.lower() for kw in ['valor', 'saldo'])
+                from openpyxl.worksheet.table import Table, TableStyleInfo
+                tab = Table(displayName="TablaProcesada", ref=table_range)
                 
-                if is_money:
-                    for cell in worksheet[col_letter][1:]: # Saltamos la cabecera
-                        cell.number_format = number_format
+                style = TableStyleInfo(name="TableStyleMedium9", showFirstColumn=False,
+                                       showLastColumn=False, showRowStripes=True, showColumnStripes=False)
+                tab.tableStyleInfo = style
+                worksheet.add_table(tab)
                 
-                # Ajustar ancho de columnas
-                data_max = 0
-                for val in df[col_name]:
-                    val_str = str(val) if not pd.isna(val) else ""
-                    if len(val_str) > data_max:
-                        data_max = len(val_str)
+                # Aplicar formato numérico explícito
+                from openpyxl.styles import NamedStyle
+                number_format = '#,##0.00'
                 
-                head_len = len(str(col_name))
-                column_length = max(data_max, head_len) + 4 # Un poco más de margen
-                worksheet.column_dimensions[col_letter].width = column_length
+                for i, col_name in enumerate(df.columns):
+                    col_letter = get_column_letter(i + 1)
+                    is_money = any(kw in col_name.lower() for kw in ['valor', 'saldo'])
+                    
+                    if is_money:
+                        for cell in worksheet[col_letter][1:]:
+                            cell.number_format = number_format
+                    
+                    # Ajustar ancho de columnas
+                    data_max = 0
+                    for val in df[col_name]:
+                        val_str = str(val) if not pd.isna(val) else ""
+                        if len(val_str) > data_max:
+                            data_max = len(val_str)
+                    
+                    head_len = len(str(col_name))
+                    column_length = max(data_max, head_len) + 4
+                    worksheet.column_dimensions[col_letter].width = column_length
+            else:
+                # Si no hay datos, al menos poner un mensaje o dejar la hoja vacía
+                worksheet.cell(row=1, column=1, value="No se encontraron transacciones en el formato esperado.")
 
         output.seek(0)
         
