@@ -22,18 +22,26 @@ def clean_currency(value):
     if isinstance(value, (int, float)):
         return float(value)
     
-    # Eliminar símbolos de moneda, espacios y comas (separadores de miles)
-    # Suponiendo formato estándar: $ 1.234,56 o 1,234.56
-    s_value = str(value).replace('$', '').replace(' ', '').strip()
+    # Convertir a cadena y limpiar espacios y símbolos
+    s_value = str(value).replace('$', '').strip()
+    if not s_value or s_value == '.00':
+        return 0.0
+
+    # Determinar si el separador decimal es coma o punto
+    # Si hay ambos, el que esté más a la derecha suele ser el decimal
+    last_dot = s_value.rfind('.')
+    last_comma = s_value.rfind(',')
     
-    # Manejar formato europeo (puntos para miles, comas para decimales)
-    # Si hay puntos y comas, asumimos punto=mil, coma=decimal
-    if '.' in s_value and ',' in s_value:
+    if last_dot > last_comma:
+        # Formato US: 1,234.56 -> eliminar comas, mantener punto
+        s_value = s_value.replace(',', '')
+    elif last_comma > last_dot:
+        # Formato EU: 1.234,56 -> eliminar puntos, cambiar coma por punto
         s_value = s_value.replace('.', '').replace(',', '.')
-    # Si solo hay coma y está al final (ej 1234,56), asumimos decimal
-    elif ',' in s_value:
+    else:
+        # Solo hay uno o ninguno
         s_value = s_value.replace(',', '.')
-        
+
     try:
         return float(s_value)
     except ValueError:
@@ -45,66 +53,83 @@ async def process_file(file: UploadFile = File(...)):
         raise HTTPException(status_code=400, detail="Formato de archivo no soportado")
 
     try:
-        # Leer el archivo excel
+        # Leer el archivo excel completo inicialmente sin cabecera para encontrarla
         contents = await file.read()
-        df = pd.read_excel(io.BytesIO(contents))
+        df_raw = pd.read_excel(io.BytesIO(contents), header=None)
+        
+        # Buscar la fila de cabecera
+        header_row_index = 0
+        target_keywords = ['fecha', 'descripcion', 'valor', 'saldo']
+        for i, row in df_raw.iterrows():
+            row_values = [str(x).lower().strip() for x in row.values if not pd.isna(x)]
+            matches = sum(1 for kw in target_keywords if any(kw in rv for rv in row_values))
+            if matches >= 2:
+                header_row_index = i
+                break
+        
+        # Volver a leer desde la fila encontrada
+        df = pd.read_excel(io.BytesIO(contents), header=header_row_index)
 
-        # Columnas a procesar
-        target_columns = ['suma de valor', 'suma de saldo']
+        # Normalizar nombres de columnas
+        df.columns = [str(c).strip() for c in df.columns]
         
-        # Normalizar nombres de columnas a minúsculas para búsqueda flexible
-        df.columns = [str(c).lower().strip() for c in df.columns]
+        # Identificar columnas de Valor y Saldo (pueden venir como 'VALOR', 'Suma de VALOR', etc)
+        valor_cols = [c for c in df.columns if 'valor' in c.lower()]
+        saldo_cols = [c for c in df.columns if 'saldo' in c.lower()]
         
-        for col in target_columns:
-            if col in df.columns:
-                df[col] = df[col].apply(clean_currency)
-            else:
-                # Si no encuentra la columna exacta, buscar parecidas
-                found = False
-                for actual_col in df.columns:
-                    if col in actual_col:
-                        df[actual_col] = df[actual_col].apply(clean_currency)
-                        found = True
-                        break
+        cols_to_fix = valor_cols + saldo_cols
+        
+        for col in cols_to_fix:
+            df[col] = df[col].apply(clean_currency)
 
         # Exportar a Excel con formato de tabla
         output = io.BytesIO()
         with pd.ExcelWriter(output, engine='openpyxl') as writer:
             df.to_excel(writer, index=False, sheet_name='Data Procesada')
             
-            # Obtener el workbook y el worksheet para aplicar formato de tabla
             workbook = writer.book
             worksheet = writer.sheets['Data Procesada']
             
-            # Definir el rango de la tabla
             num_rows, num_cols = df.shape
-            # Convertir column index a letra (0=A, 1=B, etc)
             from openpyxl.utils import get_column_letter
             last_col_letter = get_column_letter(num_cols)
+            # El rango incluye la cabecera (fila 1) hasta num_rows + 1
             table_range = f"A1:{last_col_letter}{num_rows + 1}"
             
-            # Crear el objeto tabla
             from openpyxl.worksheet.table import Table, TableStyleInfo
             tab = Table(displayName="TablaProcesada", ref=table_range)
             
-            # Estilo de tabla (claro, con filas alternas)
             style = TableStyleInfo(name="TableStyleMedium9", showFirstColumn=False,
                                    showLastColumn=False, showRowStripes=True, showColumnStripes=False)
             tab.tableStyleInfo = style
             worksheet.add_table(tab)
             
-            # Ajustar ancho de columnas automáticamente
-            for i, column in enumerate(df.columns):
-                # Calcular el largo máximo de los datos en la columna de forma segura
+            # Aplicar formato numérico explícito a las columnas de dinero
+            # Esto soluciona el problema de que Excel haga "recuento" (count) en lugar de suma
+            from openpyxl.styles import NamedStyle
+            # Crear un estilo de número si no existe
+            number_format = '#,##0.00'
+            
+            for i, col_name in enumerate(df.columns):
+                col_letter = get_column_letter(i + 1)
+                
+                # Si es columna de dinero, aplicar formato
+                is_money = any(kw in col_name.lower() for kw in ['valor', 'saldo'])
+                
+                if is_money:
+                    for cell in worksheet[col_letter][1:]: # Saltamos la cabecera
+                        cell.number_format = number_format
+                
+                # Ajustar ancho de columnas
                 data_max = 0
-                for val in df[column]:
+                for val in df[col_name]:
                     val_str = str(val) if not pd.isna(val) else ""
                     if len(val_str) > data_max:
                         data_max = len(val_str)
                 
-                head_len = len(str(column))
-                column_length = max(data_max, head_len) + 2
-                worksheet.column_dimensions[get_column_letter(i + 1)].width = column_length
+                head_len = len(str(col_name))
+                column_length = max(data_max, head_len) + 4 # Un poco más de margen
+                worksheet.column_dimensions[col_letter].width = column_length
 
         output.seek(0)
         
