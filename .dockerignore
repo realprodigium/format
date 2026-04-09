@@ -1,0 +1,15 @@
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.venv
+venv
+env
+.git
+.gitignore
+test_api.py
+test_output.xlsx
+data_procesada.xlsx
+data.xlsx
+.vscode
+.idea
