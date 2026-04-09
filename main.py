@@ -110,7 +110,7 @@ async def process_file(file: UploadFile = File(...)):
                 # Si el valor y saldo son 0 y la descripción parece metadato, borrar
                 # (A veces hay transacciones de 0, pero suelen tener descripción clara)
                 metadata_desc = ['desde', 'hasta', 'nro cuenta', 'cliente', 'sucursal']
-                mask_meta = df[desc_col].astype(str).lower().str.contains('|'.join(metadata_desc), na=False)
+                mask_meta = df[desc_col].astype(str).str.lower().str.contains('|'.join(metadata_desc), na=False)
                 df = df[~mask_meta]
 
         # Exportar a Excel con formato de tabla
