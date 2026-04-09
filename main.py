@@ -90,7 +90,7 @@ async def process_file(file: UploadFile = File(...)):
             
             # Eliminar filas de metadatos comunes en extractos bancarios
             garbage_keywords = ['información', 'cliente:', 'dirección', 'desde', 'hasta', 'movimientos:', 'resumen:']
-            mask = df[fecha_col].astype(str).lower().str.contains('|'.join(garbage_keywords), na=False)
+            mask = df[fecha_col].astype(str).str.lower().str.contains('|'.join(garbage_keywords), na=False)
             df = df[~mask]
             
             # Eliminar filas donde casi todo sea NaN (posibles separadores)
